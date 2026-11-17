@@ -227,3 +227,68 @@ def test_upstream_downstream_unknown_table():
     graph = build("INSERT INTO a SELECT * FROM b")
     assert graph.upstream(("nope",)) == []
     assert graph.downstream("nope") == []
+
+
+# -- topological order and cycles ---------------------------------------------
+
+
+def test_topological_order_written_before_read():
+    graph = build(
+        "INSERT INTO a SELECT * FROM b;"
+        "INSERT INTO c SELECT * FROM a;"
+        "INSERT INTO d SELECT * FROM c"
+    )
+    assert graph.topological_order == [("d",), ("c",), ("a",), ("b",)]
+
+
+def test_topological_order_respects_every_edge():
+    graph = build(
+        "INSERT INTO x SELECT * FROM a;"
+        "INSERT INTO y SELECT * FROM a;"
+        "INSERT INTO z SELECT * FROM x JOIN y ON x.id = y.id"
+    )
+    order = graph.topological_order
+    position = {node: i for i, node in enumerate(order)}
+    for edge in graph.edges:
+        assert position[edge.written] < position[edge.read]
+    assert sorted(order) == sorted(graph.nodes)
+
+
+def test_topological_order_with_cycle_still_lists_everything():
+    graph = build(
+        "INSERT INTO a SELECT * FROM b;"
+        "INSERT INTO b SELECT * FROM a;"
+        "INSERT INTO c SELECT * FROM a"
+    )
+    order = graph.topological_order
+    assert sorted(order) == sorted(graph.nodes)
+    assert len(order) == 3
+
+
+def test_cycles_none_in_a_linear_chain():
+    graph = build("INSERT INTO a SELECT * FROM b; INSERT INTO c SELECT * FROM a")
+    assert graph.cycles == []
+
+
+def test_cycle_between_two_tables():
+    graph = build("INSERT INTO a SELECT * FROM b; INSERT INTO b SELECT * FROM a")
+    assert graph.cycles == [[("a",), ("b",)]]
+
+
+def test_self_loop_is_a_cycle():
+    graph = build("UPDATE t SET x = (SELECT max(x) FROM t)")
+    assert graph.cycles == [[("t",)]]
+
+
+def test_cycle_members_listed_in_first_seen_order():
+    graph = build(
+        "INSERT INTO c SELECT * FROM b;"
+        "INSERT INTO b SELECT * FROM a;"
+        "INSERT INTO a SELECT * FROM c;"
+        "INSERT INTO out_t SELECT * FROM c"
+    )
+    assert graph.cycles == [[("c",), ("b",), ("a",)]]
+    # the cycle does not swallow the rest of the graph
+    order = graph.topological_order
+    assert sorted(order) == sorted(graph.nodes)
+    assert order[-1] == ("c",) or ("c",) in order

@@ -191,6 +191,72 @@ def _normalize_name(table: "tuple[str, ...] | str") -> tuple[str, ...]:
     return tuple(_clean_part(p) for p in parts if _clean_part(p))
 
 
+# -- graph algorithms ---------------------------------------------------------
+
+
+def _adjacency(
+    nodes: "list[tuple[str, ...]]", edges: "list[Edge]"
+) -> "dict[tuple[str, ...], set[tuple[str, ...]]]":
+    """Directed adjacency of the graph: written table → read table."""
+    adjacency: dict[tuple[str, ...], set[tuple[str, ...]]] = {
+        node: set() for node in nodes
+    }
+    for edge in edges:
+        adjacency[edge.written].add(edge.read)
+    return adjacency
+
+
+def _strongly_connected_components(
+    nodes: "list[tuple[str, ...]]",
+    adjacency: "dict[tuple[str, ...], set[tuple[str, ...]]]",
+) -> "list[list[tuple[str, ...]]]":
+    """Tarjan's algorithm (iterative) over the ``written -> read`` edges."""
+    index_of: dict[tuple[str, ...], int] = {}
+    lowlink: dict[tuple[str, ...], int] = {}
+    stack: list[tuple[str, ...]] = []
+    on_stack: set[tuple[str, ...]] = set()
+    components: list[list[tuple[str, ...]]] = []
+    counter = 0
+    for root in nodes:
+        if root in index_of:
+            continue
+        index_of[root] = lowlink[root] = counter
+        counter += 1
+        stack.append(root)
+        on_stack.add(root)
+        call_stack = [(root, iter(adjacency[root]))]
+        while call_stack:
+            node, successors = call_stack[-1]
+            descended = False
+            for succ in successors:
+                if succ not in index_of:
+                    index_of[succ] = lowlink[succ] = counter
+                    counter += 1
+                    stack.append(succ)
+                    on_stack.add(succ)
+                    call_stack.append((succ, iter(adjacency[succ])))
+                    descended = True
+                    break
+                if succ in on_stack:
+                    lowlink[node] = min(lowlink[node], index_of[succ])
+            if descended:
+                continue
+            call_stack.pop()
+            if call_stack:
+                parent = call_stack[-1][0]
+                lowlink[parent] = min(lowlink[parent], lowlink[node])
+            if lowlink[node] == index_of[node]:
+                component = []
+                while True:
+                    member = stack.pop()
+                    on_stack.discard(member)
+                    component.append(member)
+                    if member == node:
+                        break
+                components.append(component)
+    return components
+
+
 @dataclass(frozen=True)
 class Edge:
     """A single read/write relationship between two tables.
@@ -296,13 +362,50 @@ class LineageGraph:
 
     @property
     def topological_order(self) -> list[tuple[str, ...]]:
-        """Nodes ordered written-before-read; cycles do not break the order."""
-        raise NotImplementedError
+        """Nodes ordered written-before-read; cycles do not break the order.
+
+        Follows the edge direction (written table before the tables it
+        was read from).  When the remaining nodes form a cycle, the
+        earliest-appearing node is emitted first and the walk continues,
+        so a cyclic batch still yields every node exactly once.
+        """
+        nodes = self.nodes
+        rank = {node: position for position, node in enumerate(nodes)}
+        incoming: dict[tuple[str, ...], set[tuple[str, ...]]] = {
+            node: set() for node in nodes
+        }
+        for edge in self.edges:
+            incoming[edge.read].add(edge.written)
+        remaining = set(nodes)
+        order: list[tuple[str, ...]] = []
+        while remaining:
+            ready = [n for n in remaining if not incoming[n] & remaining]
+            # no ready node -> cycle: break it at the earliest-appearing node
+            pick = min(ready, key=rank.__getitem__) if ready else min(
+                remaining, key=rank.__getitem__
+            )
+            order.append(pick)
+            remaining.discard(pick)
+        return order
 
     @property
     def cycles(self) -> list[list[tuple[str, ...]]]:
-        """Cycles in the graph; members listed in first-seen order."""
-        raise NotImplementedError
+        """Cycles in the graph; members listed in first-seen order.
+
+        A cycle is a strongly connected component of more than one
+        table, or a single table that a statement both reads and writes.
+        """
+        nodes = self.nodes
+        rank = {node: position for position, node in enumerate(nodes)}
+        adjacency = _adjacency(nodes, self.edges)
+        result: list[list[tuple[str, ...]]] = []
+        for component in _strongly_connected_components(nodes, adjacency):
+            if len(component) > 1:
+                result.append(sorted(component, key=rank.__getitem__))
+            elif component[0] in adjacency[component[0]]:
+                result.append(component)
+        result.sort(key=lambda cycle: min(rank[node] for node in cycle))
+        return result
 
 
 def build(sql: str) -> LineageGraph:
@@ -314,8 +417,10 @@ def build(sql: str) -> LineageGraph:
     graph = LineageGraph()
     for index, ast in _split_statements(sql):
         reads, writes = _extract_reads_writes(ast)
-        read_keys = graph._keys_for(reads)
+        # writes are registered before reads so first-seen order matches
+        # the textual order of the statement (target precedes sources)
         write_keys = graph._keys_for(writes)
+        read_keys = graph._keys_for(reads)
         if not read_keys and not write_keys:
             continue
         graph._statements.append(
