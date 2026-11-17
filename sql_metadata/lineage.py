@@ -29,13 +29,128 @@ lists written tables before the tables they were read from.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
+import sqlglot
 from sqlglot import exp
+from sqlglot.errors import ParseError, TokenError
 
 from sql_metadata.dialect_parser import DialectParser
 
 __all__ = ["Edge", "LineageGraph", "StatementLineage", "build"]
+
+
+# -- statement splitting ----------------------------------------------------
+
+
+def _parse_all(sql: str, dialect: object) -> "list[exp.Expression | None]":
+    """Parse *sql* into a list of statement ASTs with one dialect.
+
+    Mirrors :meth:`DialectParser._parse_with_dialect` (same ``WARN``
+    error level and logger suppression) but keeps every statement of the
+    batch instead of only the first one.
+    """
+    logger = logging.getLogger("sqlglot")
+    old_level = logger.level
+    logger.setLevel(logging.CRITICAL)
+    try:
+        return sqlglot.parse(sql, dialect=dialect, error_level=sqlglot.ErrorLevel.WARN)
+    finally:
+        logger.setLevel(old_level)
+
+
+def _split_statements(sql: str) -> "list[tuple[int, exp.Expression]]":
+    """Split *sql* into ``(index, ast)`` pairs, one per statement.
+
+    Reuses :class:`DialectParser` dialect detection and parse-quality
+    checks so a batch is parsed exactly the way the rest of the library
+    would parse its statements.  Empty and comment-only statements
+    (which sqlglot reports as ``None``) and stray semicolons are
+    skipped; the returned indices still reflect the original position
+    in the batch.
+    """
+    if not sql or not sql.strip():
+        return []
+    dialects = DialectParser._detect_dialects(sql)
+    parser = DialectParser()
+    for dialect in dialects:
+        try:
+            results = _parse_all(sql, dialect)
+        except (ParseError, TokenError):
+            continue
+        statements = [
+            (index, result)
+            for index, result in enumerate(results)
+            if result is not None and not isinstance(result, exp.Semicolon)
+        ]
+        if not statements:
+            continue
+        is_last = dialect == dialects[-1]
+        if not is_last and any(
+            parser._is_degraded(result, sql) for _, result in statements
+        ):
+            continue
+        return statements
+    return []
+
+
+# -- read/write determination ------------------------------------------------
+
+
+def _target_table(node: "exp.Expression | None") -> "exp.Table | None":
+    """Unwrap a DML target down to its :class:`~sqlglot.exp.Table` node."""
+    while isinstance(node, exp.Schema):
+        node = node.this
+    return node if isinstance(node, exp.Table) else None
+
+
+def _write_targets(ast: exp.Expression) -> "list[exp.Table]":
+    """Physical tables written by the statement rooted at *ast*.
+
+    * ``INSERT INTO t`` / ``UPDATE t`` / ``DELETE FROM t`` → ``t``
+    * ``CREATE TABLE t ...`` (with or without ``AS SELECT``) → ``t``
+
+    Anything else (plain ``SELECT``, ``DROP``, ``exp.Command``, …)
+    writes nothing.
+    """
+    target: "exp.Expression | None" = None
+    if isinstance(ast, (exp.Insert, exp.Update, exp.Delete)):
+        target = ast.this
+    elif isinstance(ast, exp.Create) and ast.kind == "TABLE":
+        target = ast.this
+    table = _target_table(target)
+    return [table] if table is not None else []
+
+
+def _cte_names(ast: exp.Expression) -> set:
+    """Lower-cased names of all CTEs defined in the statement."""
+    return {cte.alias.lower() for cte in ast.find_all(exp.CTE)}
+
+
+def _extract_reads_writes(
+    ast: exp.Expression,
+) -> "tuple[list[exp.Table], list[exp.Table]]":
+    """Return ``(read_tables, write_tables)`` for one statement AST.
+
+    Reads are every physical table referenced anywhere in the statement
+    — ``FROM``/``JOIN`` clauses, ``USING``, subqueries in ``SET`` or
+    ``WHERE``, CTE bodies — drilled all the way down.  References to
+    CTE names are not physical tables and are excluded; the write
+    targets themselves are not reads.
+    """
+    writes = _write_targets(ast)
+    write_ids = {id(node) for node in writes}
+    cte_names = _cte_names(ast)
+    reads = [
+        table
+        for table in ast.find_all(exp.Table)
+        if id(table) not in write_ids
+        and not (
+            table.name.lower() in cte_names and not table.db and not table.catalog
+        )
+    ]
+    return reads, writes
 
 
 @dataclass(frozen=True)
