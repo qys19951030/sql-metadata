@@ -170,3 +170,60 @@ def test_statement_lineage_records_reads_and_writes():
     assert first.reads == (("s",),)
     assert second.reads == (("t",),)
     assert second.writes == ()
+
+
+# -- edges -------------------------------------------------------------------
+
+
+def test_edges_connect_written_to_read_with_statement_index():
+    graph = build(
+        "INSERT INTO a SELECT * FROM b;"
+        "INSERT INTO c SELECT * FROM a JOIN d ON a.id = d.id"
+    )
+    assert graph.edges == [
+        Edge(written=("a",), read=("b",), statement=0),
+        Edge(written=("c",), read=("a",), statement=1),
+        Edge(written=("c",), read=("d",), statement=1),
+    ]
+
+
+def test_opposite_directions_between_same_tables_are_both_kept():
+    graph = build(
+        "INSERT INTO a SELECT * FROM b;"
+        "INSERT INTO b SELECT * FROM a"
+    )
+    assert Edge(written=("a",), read=("b",), statement=0) in graph.edges
+    assert Edge(written=("b",), read=("a",), statement=1) in graph.edges
+    assert len(graph.edges) == 2
+
+
+def test_pure_select_and_insert_values_produce_no_edges():
+    graph = build("SELECT * FROM a; INSERT INTO t (x) VALUES (1)")
+    assert graph.edges == []
+    assert graph.nodes == [("a",), ("t",)]
+
+
+def test_self_loop_when_statement_reads_and_writes_same_table():
+    graph = build("UPDATE t SET x = (SELECT max(x) FROM t)")
+    assert graph.edges == [Edge(written=("t",), read=("t",), statement=0)]
+
+
+def test_upstream_and_downstream_one_hop():
+    graph = build(
+        "INSERT INTO a SELECT * FROM b;"
+        "INSERT INTO c SELECT * FROM a;"
+        "INSERT INTO d SELECT * FROM c"
+    )
+    assert graph.upstream(("c",)) == [("a",)]
+    assert graph.downstream(("a",)) == [("c",)]
+    # multi-hop is left to the caller: one hop only
+    assert graph.upstream(("d",)) == [("c",)]
+    # string arguments are normalised the same way
+    assert graph.upstream("C") == [("a",)]
+    assert graph.downstream("A") == [("c",)]
+
+
+def test_upstream_downstream_unknown_table():
+    graph = build("INSERT INTO a SELECT * FROM b")
+    assert graph.upstream(("nope",)) == []
+    assert graph.downstream("nope") == []

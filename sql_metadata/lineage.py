@@ -247,8 +247,21 @@ class LineageGraph:
 
     @property
     def edges(self) -> list[Edge]:
-        """All read/write edges, in statement order."""
-        raise NotImplementedError
+        """All read/write edges, in statement order.
+
+        Every statement that both reads and writes contributes one edge
+        per ``(written, read)`` pair, pointing from the written table to
+        the table it was read from.  When two statements between the
+        same pair of tables go opposite ways, both edges are kept.
+        """
+        result: list[Edge] = []
+        for statement in self._statements:
+            for written in statement.writes:
+                for read in statement.reads:
+                    result.append(
+                        Edge(written=written, read=read, statement=statement.index)
+                    )
+        return result
 
     @property
     def statements(self) -> list[StatementLineage]:
@@ -261,11 +274,25 @@ class LineageGraph:
 
     def upstream(self, table: "tuple[str, ...] | str") -> list[tuple[str, ...]]:
         """Tables read by statements that wrote *table* (one hop)."""
-        raise NotImplementedError
+        key = _normalize_name(table)
+        seen: set[tuple[str, ...]] = set()
+        result: list[tuple[str, ...]] = []
+        for edge in self.edges:
+            if edge.written == key and edge.read not in seen:
+                seen.add(edge.read)
+                result.append(edge.read)
+        return result
 
     def downstream(self, table: "tuple[str, ...] | str") -> list[tuple[str, ...]]:
         """Tables written by statements that read *table* (one hop)."""
-        raise NotImplementedError
+        key = _normalize_name(table)
+        seen: set[tuple[str, ...]] = set()
+        result: list[tuple[str, ...]] = []
+        for edge in self.edges:
+            if edge.read == key and edge.written not in seen:
+                seen.add(edge.written)
+                result.append(edge.written)
+        return result
 
     @property
     def topological_order(self) -> list[tuple[str, ...]]:
