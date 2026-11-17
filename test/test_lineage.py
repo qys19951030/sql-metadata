@@ -1,10 +1,13 @@
 """Tests for sql_metadata.lineage — cross-statement table lineage."""
 
+from sqlglot import exp
+
 from sql_metadata.lineage import (
     Edge,
     LineageGraph,
     StatementLineage,
     _extract_reads_writes,
+    _normalize_table,
     _split_statements,
     build,
 )
@@ -43,6 +46,21 @@ def test_split_empty_input():
     assert _split_statements("") == []
     assert _split_statements("   \n  ") == []
     assert _split_statements("-- only a comment") == []
+
+
+def test_split_tolerates_unparseable_input():
+    # the unterminated string makes every dialect raise TokenError
+    assert _split_statements("SELECT '") == []
+    assert build("SELECT '").nodes == []
+
+
+def test_split_falls_back_when_first_dialect_degrades():
+    # mysql misreads the bracketed table (empty name -> degraded), so the
+    # batch is retried with the fallback dialect instead of crashing
+    statements = _split_statements("SELECT * FROM `a`; SELECT * FROM [b]")
+    assert statements
+    # names that clean down to nothing never become nodes
+    assert build("SELECT * FROM `a`; SELECT * FROM [b]").nodes == []
 
 
 # -- read/write determination ------------------------------------------------
@@ -116,11 +134,7 @@ def test_same_table_read_and_written_kept_on_both_sides():
 
 
 def test_same_table_different_spellings_merge_into_one_node():
-    graph = build(
-        "SELECT * FROM Users;"
-        'SELECT * FROM "USERS";'
-        "SELECT * FROM `users`"
-    )
+    graph = build('SELECT * FROM Users;SELECT * FROM "USERS";SELECT * FROM `users`')
     assert graph.nodes == [("users",)]
 
 
@@ -162,6 +176,17 @@ def test_empty_and_comment_only_statements_produce_no_nodes():
     assert [s.index for s in graph.statements] == [3]
 
 
+def test_statements_without_tables_are_skipped():
+    graph = build("SELECT 1; SELECT * FROM t")
+    assert graph.nodes == [("t",)]
+    assert [s.index for s in graph.statements] == [1]
+
+
+def test_normalize_table_drops_names_that_clean_to_nothing():
+    table = exp.Table(this=exp.Identifier(this="`"))
+    assert _normalize_table(table) is None
+
+
 def test_statement_lineage_records_reads_and_writes():
     graph = build("INSERT INTO t SELECT * FROM s; SELECT * FROM t")
     first, second = graph.statements
@@ -188,10 +213,7 @@ def test_edges_connect_written_to_read_with_statement_index():
 
 
 def test_opposite_directions_between_same_tables_are_both_kept():
-    graph = build(
-        "INSERT INTO a SELECT * FROM b;"
-        "INSERT INTO b SELECT * FROM a"
-    )
+    graph = build("INSERT INTO a SELECT * FROM b;INSERT INTO b SELECT * FROM a")
     assert Edge(written=("a",), read=("b",), statement=0) in graph.edges
     assert Edge(written=("b",), read=("a",), statement=1) in graph.edges
     assert len(graph.edges) == 2
@@ -291,4 +313,5 @@ def test_cycle_members_listed_in_first_seen_order():
     # the cycle does not swallow the rest of the graph
     order = graph.topological_order
     assert sorted(order) == sorted(graph.nodes)
-    assert order[-1] == ("c",) or ("c",) in order
+    # the pure sink is written before everything it (transitively) reads
+    assert order[0] == ("out_t",)

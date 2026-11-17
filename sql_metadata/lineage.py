@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Any, cast
 
 import sqlglot
 from sqlglot import exp
@@ -44,7 +45,7 @@ __all__ = ["Edge", "LineageGraph", "StatementLineage", "build"]
 # -- statement splitting ----------------------------------------------------
 
 
-def _parse_all(sql: str, dialect: object) -> "list[exp.Expression | None]":
+def _parse_all(sql: str, dialect: Any) -> "list[exp.Expression | None]":
     """Parse *sql* into a list of statement ASTs with one dialect.
 
     Mirrors :meth:`DialectParser._parse_with_dialect` (same ``WARN``
@@ -55,7 +56,10 @@ def _parse_all(sql: str, dialect: object) -> "list[exp.Expression | None]":
     old_level = logger.level
     logger.setLevel(logging.CRITICAL)
     try:
-        return sqlglot.parse(sql, dialect=dialect, error_level=sqlglot.ErrorLevel.WARN)
+        return cast(
+            "list[exp.Expression | None]",
+            sqlglot.parse(sql, dialect=dialect, error_level=sqlglot.ErrorLevel.WARN),
+        )
     finally:
         logger.setLevel(old_level)
 
@@ -123,7 +127,7 @@ def _write_targets(ast: exp.Expression) -> "list[exp.Table]":
     return [table] if table is not None else []
 
 
-def _cte_names(ast: exp.Expression) -> set:
+def _cte_names(ast: exp.Expression) -> set[str]:
     """Lower-cased names of all CTEs defined in the statement."""
     return {cte.alias.lower() for cte in ast.find_all(exp.CTE)}
 
@@ -146,9 +150,7 @@ def _extract_reads_writes(
         table
         for table in ast.find_all(exp.Table)
         if id(table) not in write_ids
-        and not (
-            table.name.lower() in cte_names and not table.db and not table.catalog
-        )
+        and not (table.name.lower() in cte_names and not table.db and not table.catalog)
     ]
     return reads, writes
 
@@ -206,7 +208,7 @@ def _adjacency(
     return adjacency
 
 
-def _strongly_connected_components(
+def _strongly_connected_components(  # noqa: C901 — iterative Tarjan is inherently branchy
     nodes: "list[tuple[str, ...]]",
     adjacency: "dict[tuple[str, ...], set[tuple[str, ...]]]",
 ) -> "list[list[tuple[str, ...]]]":
@@ -381,8 +383,10 @@ class LineageGraph:
         while remaining:
             ready = [n for n in remaining if not incoming[n] & remaining]
             # no ready node -> cycle: break it at the earliest-appearing node
-            pick = min(ready, key=rank.__getitem__) if ready else min(
-                remaining, key=rank.__getitem__
+            pick = (
+                min(ready, key=rank.__getitem__)
+                if ready
+                else min(remaining, key=rank.__getitem__)
             )
             order.append(pick)
             remaining.discard(pick)
