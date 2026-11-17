@@ -110,3 +110,63 @@ def test_same_table_read_and_written_kept_on_both_sides():
     reads, writes = _reads_writes("UPDATE t SET x = (SELECT max(x) FROM t)")
     assert _names(writes) == ["t"]
     assert _names(reads) == ["t"]
+
+
+# -- name normalisation and node merging --------------------------------------
+
+
+def test_same_table_different_spellings_merge_into_one_node():
+    graph = build(
+        "SELECT * FROM Users;"
+        'SELECT * FROM "USERS";'
+        "SELECT * FROM `users`"
+    )
+    assert graph.nodes == [("users",)]
+
+
+def test_schema_prefix_kept_as_separate_segments():
+    graph = build("SELECT * FROM Public.Users")
+    assert graph.nodes == [("public", "users")]
+    # a qualified name and a bare name are different nodes
+    graph = build("SELECT * FROM Public.Users; SELECT * FROM users")
+    assert graph.nodes == [("public", "users"), ("users",)]
+
+
+def test_quoting_styles_normalised():
+    # each quoting style is parsed by its own dialect, but all of them
+    # must normalise to the same node identity
+    assert build("SELECT * FROM `Sch`.`Tab`").nodes == [("sch", "tab")]
+    assert build('SELECT * FROM "Sch"."Tab"').nodes == [("sch", "tab")]
+    assert build("SELECT * FROM [Sch].[Tab]").nodes == [("sch", "tab")]
+
+
+def test_original_spelling_kept_for_display_only():
+    graph = build('SELECT * FROM `Public`.`Users`; SELECT * FROM "public"."users"')
+    assert graph.original_name(("public", "users")) == "Public.Users"
+    # lookup accepts a plain string too
+    assert graph.original_name("public.users") == "Public.Users"
+
+
+def test_temp_tables_never_enter_the_graph():
+    graph = build(
+        "SELECT * INTO #tmp FROM real_table;"
+        "SELECT * FROM #tmp t JOIN other_table o ON t.id = o.id"
+    )
+    assert ("#tmp",) not in graph.nodes
+    assert ("tmp",) not in graph.nodes
+
+
+def test_empty_and_comment_only_statements_produce_no_nodes():
+    graph = build(";\n-- just a comment\n;\nSELECT * FROM t")
+    assert graph.nodes == [("t",)]
+    assert [s.index for s in graph.statements] == [3]
+
+
+def test_statement_lineage_records_reads_and_writes():
+    graph = build("INSERT INTO t SELECT * FROM s; SELECT * FROM t")
+    first, second = graph.statements
+    assert first.index == 0
+    assert first.writes == (("t",),)
+    assert first.reads == (("s",),)
+    assert second.reads == (("t",),)
+    assert second.writes == ()

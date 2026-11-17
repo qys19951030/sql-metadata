@@ -30,7 +30,7 @@ lists written tables before the tables they were read from.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import sqlglot
 from sqlglot import exp
@@ -153,6 +153,44 @@ def _extract_reads_writes(
     return reads, writes
 
 
+# -- name normalisation ------------------------------------------------------
+
+
+def _clean_part(part: str) -> str:
+    """Normalise one identifier segment: strip quoting, lower-case."""
+    return part.strip('`"[]').lower()
+
+
+def _normalize_table(table: exp.Table) -> "tuple[str, ...] | None":
+    """Normalised identity of a physical table, or ``None`` to skip it.
+
+    The identity is a tuple of segments — ``("schema", "table")`` for a
+    qualified name, ``("table",)`` otherwise — so segments are kept
+    separate and never joined into a single string.  Quoting styles
+    (back-ticks, double quotes, square brackets) and case are spelling
+    details and are erased.  Temporary tables (``#temp``) never enter
+    the graph.
+    """
+    parts = [p for p in (table.catalog, table.db, table.name) if p]
+    key = tuple(c for c in (_clean_part(p) for p in parts) if c)
+    if not key:
+        return None
+    if key[-1].startswith("#"):
+        return None
+    return key
+
+
+def _display_name(table: exp.Table) -> str:
+    """Original spelling of a table name, kept for display only."""
+    return ".".join(p for p in (table.catalog, table.db, table.name) if p)
+
+
+def _normalize_name(table: "tuple[str, ...] | str") -> tuple[str, ...]:
+    """Normalise a caller-supplied table name to its node identity."""
+    parts = table.split(".") if isinstance(table, str) else list(table)
+    return tuple(_clean_part(p) for p in parts if _clean_part(p))
+
+
 @dataclass(frozen=True)
 class Edge:
     """A single read/write relationship between two tables.
@@ -184,10 +222,28 @@ class LineageGraph:
         self._statements: list[StatementLineage] = []
         self._originals: dict[tuple[str, ...], str] = {}
 
+    def _register(self, key: tuple[str, ...], display: str) -> None:
+        """Record *display* as the first-seen spelling of *key*."""
+        if key not in self._originals:
+            self._originals[key] = display
+
+    def _keys_for(self, tables: "list[exp.Table]") -> "list[tuple[str, ...]]":
+        """Normalise table nodes to unique keys, registering spellings."""
+        keys: list[tuple[str, ...]] = []
+        seen: set[tuple[str, ...]] = set()
+        for table in tables:
+            key = _normalize_table(table)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+            self._register(key, _display_name(table))
+        return keys
+
     @property
     def nodes(self) -> list[tuple[str, ...]]:
         """All normalised table names in the graph, in first-seen order."""
-        raise NotImplementedError
+        return list(self._originals)
 
     @property
     def edges(self) -> list[Edge]:
@@ -199,9 +255,9 @@ class LineageGraph:
         """Per-statement read/write sets."""
         return self._statements
 
-    def original_name(self, node: tuple[str, ...]) -> str:
+    def original_name(self, node: "tuple[str, ...] | str") -> str:
         """First-seen original spelling of *node* (display only)."""
-        raise NotImplementedError
+        return self._originals[_normalize_name(node)]
 
     def upstream(self, table: "tuple[str, ...] | str") -> list[tuple[str, ...]]:
         """Tables read by statements that wrote *table* (one hop)."""
@@ -228,4 +284,16 @@ def build(sql: str) -> LineageGraph:
     :param sql: One or more SQL statements separated by semicolons.
     :returns: The lineage graph for the batch.
     """
-    raise NotImplementedError
+    graph = LineageGraph()
+    for index, ast in _split_statements(sql):
+        reads, writes = _extract_reads_writes(ast)
+        read_keys = graph._keys_for(reads)
+        write_keys = graph._keys_for(writes)
+        if not read_keys and not write_keys:
+            continue
+        graph._statements.append(
+            StatementLineage(
+                index=index, reads=tuple(read_keys), writes=tuple(write_keys)
+            )
+        )
+    return graph
